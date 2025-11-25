@@ -1,0 +1,715 @@
+<!DOCTYPE html>
+<html lang="hi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Realistic Ludo — HTML5 Canvas</title>
+<style>
+  :root{
+    --bg:#0f1720;
+    --panel:#0b1220;
+    --muted:#9eb1be;
+  }
+  body{
+    margin:0;
+    font-family:Inter, system-ui, Arial, sans-serif;
+    background: linear-gradient(180deg,#081827,#041018);
+    color:#e6f3f7;
+    display:flex;
+    gap:14px;
+    padding:14px;
+    min-height:100vh;
+    box-sizing:border-box;
+    align-items:flex-start;
+    justify-content:center;
+  }
+  .container{
+    display:flex;
+    gap:14px;
+    flex-wrap:wrap;
+    max-width:1200px;
+    width:100%;
+  }
+  .left, .right{
+    background:var(--panel);
+    border-radius:12px;
+    padding:12px;
+    box-shadow: 0 8px 28px rgba(3,8,12,0.6);
+  }
+  .left{flex:1; min-width:520px}
+  .right{width:320px}
+  canvas{display:block;border-radius:10px;background:#071722}
+  h1{font-size:18px;margin:0 0 8px 0}
+  .muted{color:var(--muted);font-size:13px;margin-top:8px}
+  .controls{display:flex; gap:8px; margin-top:10px; flex-wrap:wrap}
+  .btn{background:#ffd166;border:0;padding:8px 12px;border-radius:8px;cursor:pointer;font-weight:700;color:#042a2b}
+  .small{padding:6px 8px;font-size:13px}
+  .dice{
+    width:64px;height:64px;border-radius:8px;display:flex;align-items:center;justify-content:center;font-weight:900;font-size:20px;background:#fff;color:#000;
+  }
+  .player-row{display:flex;align-items:center;gap:8px;margin-top:8px}
+  .token-mini{width:18px;height:18px;border-radius:50%;display:inline-block}
+  .status{margin-top:10px;font-weight:700}
+  footer{font-size:12px;color:var(--muted);margin-top:10px}
+  @media (max-width:880px){
+    body{padding:8px}
+    .left{min-width:320px}
+    .right{width:100%}
+  }
+</style>
+</head>
+<body>
+  <div class="container">
+    <div class="left">
+      <h1>Realistic Ludo</h1>
+      <canvas id="board" width="720" height="720"></canvas>
+      <div class="muted">Click / tap "Roll" to roll dice. Click a highlighted token to move it.</div>
+      <div class="controls">
+        <div id="diceBox" class="dice">-</div>
+        <button id="rollBtn" class="btn">Roll</button>
+        <button id="newBtn" class="btn small">New Game</button>
+        <button id="rulesBtn" class="btn small">Short Rules</button>
+      </div>
+      <div class="status" id="status">Status: Ready</div>
+    </div>
+
+    <div class="right">
+      <h1>Players</h1>
+      <div id="playersList"></div>
+      <div class="muted" style="margin-top:10px">Safe squares (no capture): highlighted with star on board.</div>
+      <footer>Designed to be realistic: finishing lanes, captures, extra turns on 6, win detection.</footer>
+    </div>
+  </div>
+
+<script>
+/*
+Realistic Ludo single-file implementation
+Author: ChatGPT helper (Hindi) — modify as needed
+Key model:
+- Outer track: 52 cells (0..51)
+- Each player start index: [0,13,26,39]
+- Steps to finish: 57 (0 = just out onto start cell; 56 = last home cell)
+- Token state: steps = -1 (in home), 0..57 (on board/progress). When steps === FINISH_STEPS -> finished.
+- Board positions (visual) computed for outer track + home columns.
+- Safe squares: array of indices where capture is not allowed.
+*/
+
+const canvas = document.getElementById('board');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+const rollBtn = document.getElementById('rollBtn');
+const newBtn = document.getElementById('newBtn');
+const rulesBtn = document.getElementById('rulesBtn');
+const diceBox = document.getElementById('diceBox');
+const statusEl = document.getElementById('status');
+const playersList = document.getElementById('playersList');
+
+const CENTER = {x: W/2, y: H/2};
+const OUTER_RADIUS = 300; // visual radius for outer track
+
+// Game constants
+const NUM_PLAYERS = 4;
+const TOKENS_PER_PLAYER = 4;
+const TRACK_LEN = 52;
+const FINAL_COLUMN = 6; // number of steps in finishing column (including final cell)
+const FINISH_STEPS = TRACK_LEN + FINAL_COLUMN; // 52 + 6 = 58 (we'll treat finished when steps === FINISH_STEPS)
+const START_INDICES = [0,13,26,39]; // standard
+// Choose safe squares (commonly starts + some star squares). This is a typical set used by many Ludo boards:
+const SAFE_INDICES = new Set([0,8,13,21,26,34,39,47]);
+
+// Colors for players
+const PLAYER_COLORS = ['#ef476f','#ffd166','#06d6a0','#118ab2'];
+
+// Data model
+let tokens; // tokens[player][i] = {player, idx, steps, finished}
+let currentPlayer = 0;
+let diceValue = -1;
+let selectable = []; // array of {player, idx} that can be moved after roll
+let gameActive = true;
+let winners = [];
+
+// layout caches
+const trackCoords = []; // length TRACK_LEN -> {x,y}
+const homeBases = [];   // 4 corners for home token drawing
+const finishCoords = {}; // finishCoords[player] = array of 6 coords for final column (inwards)
+
+// visual constants
+const CELL_R = 20;
+const TOKEN_R = 14;
+
+// helpers
+function mod(a,b){ return ((a % b) + b) % b; }
+
+// init layout
+function computeLayout(){
+  // compute track coords around a square-ish loop for better Ludo look
+  // Approach: place 13 cells per side (13*4=52). We'll create positions along rectangle perimeter.
+  const margin = 80;
+  const left = margin, top = margin, right = W - margin, bottom = H - margin;
+  // top side: left -> right (13 cells, indices 0..12)
+  const perSide = 13;
+  // function to interpolate n points inclusive-exclusive
+  function linePoints(x1,y1,x2,y2,n){
+    const arr=[];
+    for(let i=0;i<n;i++){
+      const t = i/(n-1);
+      const x = x1 + (x2-x1)*t;
+      const y = y1 + (y2-y1)*t;
+      arr.push({x,y});
+    }
+    return arr;
+  }
+  const topSide = linePoints(left,top, right,top, perSide+1).slice(0,-1); // 13
+  const rightSide = linePoints(right,top, right,bottom, perSide+1).slice(0,-1);
+  const bottomSide = linePoints(right,bottom, left,bottom, perSide+1).slice(0,-1);
+  const leftSide = linePoints(left,bottom, left,top, perSide+1).slice(0,-1);
+  const loop = [...topSide, ...rightSide, ...bottomSide, ...leftSide]; // 52
+  // center the points nicely (they already are)
+  for(let i=0;i<TRACK_LEN;i++){
+    trackCoords[i] = loop[i];
+  }
+  // home bases: 4 corners inside board
+  homeBases[0] = {x: left + 60, y: top + 60}; // top-left
+  homeBases[1] = {x: right - 60, y: top + 60}; // top-right
+  homeBases[2] = {x: right - 60, y: bottom - 60}; // bottom-right
+  homeBases[3] = {x: left + 60, y: bottom - 60}; // bottom-left
+
+  // compute finish columns for each player (6 cells leading to center)
+  // For each player, the finish column is a straight line from just before center towards center.
+  // We'll position them as short lines from near center outward.
+  const centerOffset = 60;
+  // Up (player 0's finish goes down to center), Right, Down, Left order mapping:
+  const directions = [
+    {dx:0, dy:1}, // player0: entering from top towards center
+    {dx:-1, dy:0}, // player1: entering from right towards center
+    {dx:0, dy:-1}, // player2: entering from bottom towards center
+    {dx:1, dy:0}  // player3: entering from left towards center
+  ];
+  for(let p=0;p<NUM_PLAYERS;p++){
+    finishCoords[p] = [];
+    const dir = directions[p];
+    // compute base position: the cell just before the player's start (the entry to finish)
+    // Convention: Players move from their start and after completing loop they'll reach their "home entry"
+    // Home entry visual: choose trackCoords[(START_INDEX + 51) % 52] as near corner
+    const entryIdx = mod(START_INDICES[p] + TRACK_LEN - 1, TRACK_LEN);
+    const entry = trackCoords[entryIdx];
+    // create FINAL_COLUMN positions from near entry towards center
+    // step size
+    for(let s=1; s<=FINAL_COLUMN; s++){
+      // pos moves towards center: entry + (center - entry) * (s / (FINAL_COLUMN+1))
+      const t = s / (FINAL_COLUMN + 1);
+      const x = entry.x + (CENTER.x - entry.x) * t;
+      const y = entry.y + (CENTER.y - entry.y) * t;
+      finishCoords[p].push({x, y});
+    }
+  }
+}
+
+computeLayout();
+
+// initialize game model
+function newGame(){
+  tokens = [];
+  for(let p=0;p<NUM_PLAYERS;p++){
+    const arr=[];
+    for(let i=0;i<TOKENS_PER_PLAYER;i++){
+      arr.push({player:p, idx:i, steps:-1, finished:false}); // steps -1 => home
+    }
+    tokens.push(arr);
+  }
+  currentPlayer = 0;
+  diceValue = -1;
+  selectable = [];
+  gameActive = true;
+  winners = [];
+  diceBox.textContent = '-';
+  updatePlayersList();
+  setStatus(`Player ${currentPlayer+1} to play`);
+  draw();
+}
+newGame();
+
+// compute board index for token if token.steps >= 0 and <= TRACK_LEN
+// returns {type:'track', index} or {type:'finish', index} or {type:'home'}
+function tokenPosition(token){
+  if(token.steps === -1) return {type:'home'}; // in home
+  if(token.steps >= FINISH_STEPS){
+    return {type:'finished'}; // beyond final
+  }
+  // steps 0..TRACK_LEN-1 => on main track, steps TRACK_LEN..FINISH_STEPS-1 => finish column
+  if(token.steps < TRACK_LEN){
+    const boardIndex = mod(START_INDICES[token.player] + token.steps, TRACK_LEN);
+    return {type:'track', index: boardIndex};
+  } else {
+    // finish column index:
+    const fIdx = token.steps - TRACK_LEN; // 0..FINAL_COLUMN-1
+    return {type:'finish', index: fIdx};
+  }
+}
+
+// utility: get tokens on a given track index
+function tokensAtTrackIndex(index){
+  const found=[];
+  for(let p=0;p<tokens.length;p++){
+    for(let t of tokens[p]){
+      const pos = tokenPosition(t);
+      if(pos.type==='track' && pos.index === index){
+        found.push(t);
+      }
+    }
+  }
+  return found;
+}
+
+// safety: is index a safe square?
+function isSafe(index){
+  return SAFE_INDICES.has(index);
+}
+
+// roll dice with simple animation
+function rollDiceAnim(){
+  let spins = 10;
+  rollBtn.disabled = true;
+  diceBox.textContent = '';
+  const iv = setInterval(()=>{
+    const v = Math.floor(Math.random()*6)+1;
+    diceBox.textContent = v;
+    spins--;
+    if(spins<=0){
+      clearInterval(iv);
+      diceValue = Math.floor(Math.random()*6)+1;
+      diceBox.textContent = diceValue;
+      rollBtn.disabled = false;
+      afterRoll();
+    }
+  },80);
+}
+
+// after rolling, compute selectable tokens for current player
+function afterRoll(){
+  if(!gameActive) return;
+  selectable = computeSelectableTokens(currentPlayer, diceValue);
+  if(selectable.length === 0){
+    setStatus(`Player ${currentPlayer+1}: no moves. ${diceValue===6?'But 6 gives extra roll (if you want to roll again).':'Turn passes.'}`);
+    // if dice was 6, allow extra roll (some variants give extra roll despite no move; we'll allow immediate auto roll option)
+    if(diceValue===6){
+      // keep same player's turn; user must click Roll again
+      // do nothing automatic; show hint
+    } else {
+      // pass turn automatically after a short delay
+      setTimeout(()=>{ nextTurn(); draw(); }, 800);
+    }
+  } else {
+    setStatus(`Player ${currentPlayer+1}: select a token to move (${diceValue})`);
+  }
+  draw();
+}
+
+// compute which tokens can be moved for player given roll
+function computeSelectableTokens(player, roll){
+  const arr = tokens[player];
+  const options = [];
+  for(let i=0;i<arr.length;i++){
+    const t = arr[i];
+    if(t.finished) continue;
+    if(t.steps === -1){
+      // in home: only can come out on roll===6
+      if(roll === 6){
+        // check if start cell occupied by own token -> cannot come out (by rules)
+        const destIdx = START_INDICES[player];
+        const occupyingOwn = tokens[player].some(tt => {
+          const pos = tokenPosition(tt);
+          return pos.type==='track' && pos.index === destIdx;
+        });
+        if(!occupyingOwn){
+          options.push({player, idx:i});
+        }
+      }
+    } else {
+      // token on board or finish column: check if move possible without exceeding finish
+      const newSteps = t.steps + roll;
+      if(newSteps <= FINISH_STEPS){
+        // additional rule: if moving from track into finish column, ensure correct count (we allow exact landing)
+        // check blocked by own token in finish position? Many Ludo rules allow stacking of own tokens; we'll allow multiple in same finish slot.
+        options.push({player, idx:i});
+      }
+    }
+  }
+  return options;
+}
+
+// apply a move (player, token idx) with current diceValue
+function applyMove(player, idx){
+  if(!gameActive) return;
+  if(player !== currentPlayer) return;
+  if(diceValue < 1) return;
+  const t = tokens[player][idx];
+  const legal = selectable.some(s => s.player===player && s.idx===idx);
+  if(!legal) return;
+  // move
+  if(t.steps === -1 && diceValue === 6){
+    // bring out: steps = 0 => placed on start cell
+    t.steps = 0;
+  } else if(t.steps >= 0){
+    t.steps += diceValue;
+  } else {
+    // invalid
+    return;
+  }
+  // check finish
+  if(t.steps === FINISH_STEPS){
+    t.finished = true;
+    setStatus(`Player ${player+1} token ${idx+1} finished!`);
+  } else {
+    setStatus(`Player ${player+1} moved token ${idx+1} to steps=${t.steps}`);
+  }
+  // if token landed on main track, check capture
+  const pos = tokenPosition(t);
+  if(pos.type === 'track'){
+    if(!isSafe(pos.index)){
+      // capture opponents on same index
+      for(let p=0;p<tokens.length;p++){
+        if(p===player) continue;
+        for(let ot of tokens[p]){
+          const opos = tokenPosition(ot);
+          if(opos.type === 'track' && opos.index === pos.index){
+            // send opponent token to home
+            ot.steps = -1;
+            ot.finished = false;
+            setStatus(prev=> prev + ` Captured P${p+1} token!`);
+          }
+        }
+      }
+    }
+  }
+  // check if player finished all tokens
+  const finishedCount = tokens[player].filter(tt => tt.finished).length;
+  if(finishedCount === TOKENS_PER_PLAYER){
+    winners.push(player);
+    setStatus(`Player ${player+1} has finished!`);
+    // remove player from active rotation: mark as inactive by setting finished tokens but still allow other players
+  }
+  // after move: decide next action
+  // if dice was 6 -> player gets extra turn (unless game ended)
+  if(diceValue === 6){
+    selectable = computeSelectableTokens(currentPlayer, 6); // recompute possibilities for another 6 (if they choose to roll again)
+    diceValue = -1;
+    diceBox.textContent = '-';
+    // keep same player: require them to press Roll to roll again
+    setStatus(`Player ${currentPlayer+1} rolled a 6 and moved — roll again or move another token if possible.`);
+  } else {
+    // pass turn
+    diceValue = -1;
+    diceBox.textContent = '-';
+    selectable = [];
+    setTimeout(()=>{ nextTurn(); draw(); }, 450);
+  }
+  updatePlayersList();
+  draw();
+}
+
+// advance to next active player (skip players who already won)
+function nextTurn(){
+  if(winners.length >= NUM_PLAYERS - 1){
+    // game over (only one left)
+    gameActive = false;
+    setStatus('Game over. Winners: ' + winners.map(w=>w+1).join(', '));
+    return;
+  }
+  // increment until find a player who hasn't finished all tokens
+  let attempts=0;
+  do {
+    currentPlayer = (currentPlayer + 1) % NUM_PLAYERS;
+    attempts++;
+    // if this player has already finished all tokens, skip
+    const finishedCount = tokens[currentPlayer].filter(tt=>tt.finished).length;
+    if(finishedCount < TOKENS_PER_PLAYER) break;
+  } while(attempts < 10);
+  setStatus(`Player ${currentPlayer+1}'s turn`);
+  diceValue = -1;
+  diceBox.textContent = '-';
+  selectable = [];
+  updatePlayersList();
+}
+
+// drawing functions
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  drawBoardBackground();
+  drawTrack();
+  drawFinishColumns();
+  drawHomeAreas();
+  drawTokens();
+  drawSafeMarkers();
+  drawCenter();
+}
+
+// board bg
+function drawBoardBackground(){
+  // subtle background
+  ctx.fillStyle = '#071822';
+  ctx.fillRect(0,0,W,H);
+}
+
+// draw track cells
+function drawTrack(){
+  for(let i=0;i<TRACK_LEN;i++){
+    const p = trackCoords[i];
+    ctx.beginPath();
+    ctx.fillStyle = '#083045';
+    ctx.strokeStyle = '#06212b';
+    ctx.lineWidth = 2;
+    ctx.arc(p.x, p.y, CELL_R, 0, Math.PI*2);
+    ctx.fill();
+    ctx.stroke();
+    // index small
+    ctx.fillStyle = 'rgba(255,255,255,0.06)';
+    ctx.font = '10px sans-serif';
+    ctx.fillText(i, p.x-6, p.y+3);
+  }
+}
+
+// draw finish columns
+function drawFinishColumns(){
+  for(let p=0;p<NUM_PLAYERS;p++){
+    for(let i=0;i<FINAL_COLUMN;i++){
+      const c = finishCoords[p][i];
+      ctx.beginPath();
+      ctx.fillStyle = (i===FINAL_COLUMN-1) ? '#0a6a4a' : '#0b4560';
+      ctx.strokeStyle = '#04282b';
+      ctx.arc(c.x, c.y, CELL_R+2, 0, Math.PI*2);
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+}
+
+// draw home areas and tokens inside home
+function drawHomeAreas(){
+  for(let p=0;p<NUM_PLAYERS;p++){
+    const base = homeBases[p];
+    // draw square
+    ctx.fillStyle = '#05202a';
+    ctx.fillRect(base.x - 60, base.y - 60, 120, 120);
+    ctx.strokeStyle = '#0a313b';
+    ctx.strokeRect(base.x - 60, base.y - 60, 120, 120);
+    // player color quadrant background
+    ctx.fillStyle = PLAYER_COLORS[p];
+    ctx.globalAlpha = 0.08;
+    ctx.fillRect(base.x - 60, base.y - 60, 120, 120);
+    ctx.globalAlpha = 1;
+    // draw tokens in home (grid 2x2)
+    const arr = tokens[p];
+    for(let i=0;i<arr.length;i++){
+      const hx = base.x - 30 + (i%2)*45;
+      const hy = base.y - 30 + Math.floor(i/2)*45;
+      ctx.beginPath();
+      ctx.fillStyle = PLAYER_COLORS[p];
+      ctx.arc(hx, hy, TOKEN_R, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = '#021012';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // mark if token is out
+      if(arr[i].steps !== -1) {
+        // small checkmark
+        ctx.fillStyle = '#0a0a0a';
+        ctx.font = '10px sans-serif';
+        ctx.fillText('→', hx-5, hy+4);
+      }
+    }
+    // label
+    ctx.fillStyle = '#bfe6ef';
+    ctx.font = '12px sans-serif';
+    ctx.fillText('P' + (p+1), base.x - 10, base.y + 60);
+  }
+}
+
+// draw tokens on track + finish
+function drawTokens(){
+  // draw tokens on track first (so home tokens overlap nicely)
+  for(let p=0;p<tokens.length;p++){
+    for(let t of tokens[p]){
+      const pos = tokenPosition(t);
+      let cx, cy;
+      if(pos.type==='home'){
+        // drawn already in home area; skip
+        continue;
+      } else if(pos.type==='track'){
+        const c = trackCoords[pos.index];
+        cx = c.x; cy = c.y;
+      } else if(pos.type==='finish'){
+        const c = finishCoords[p][pos.index];
+        cx = c.x; cy = c.y;
+      } else { // finished
+        // place inside center small circle
+        cx = CENTER.x + (Math.random()*6-3); cy = CENTER.y + (Math.random()*6-3);
+      }
+      // draw highlight if selectable
+      const isSel = selectable.some(s => s.player===t.player && s.idx===t.idx);
+      ctx.beginPath();
+      ctx.fillStyle = PLAYER_COLORS[p];
+      ctx.arc(cx, cy, TOKEN_R, 0, Math.PI*2);
+      ctx.fill();
+      ctx.lineWidth = isSel ? 4 : 2;
+      ctx.strokeStyle = isSel ? '#ffffff' : '#021012';
+      ctx.stroke();
+      // draw index
+      ctx.fillStyle = '#021012';
+      ctx.font = '12px sans-serif';
+      ctx.fillText((t.idx+1), cx-6, cy+4);
+    }
+  }
+}
+
+// draw safe markers (star)
+function drawSafeMarkers(){
+  for(let idx of SAFE_INDICES){
+    const p = trackCoords[idx];
+    ctx.save();
+    ctx.translate(p.x, p.y);
+    // draw small star
+    star(ctx, 0, 0, 5, 10, 5);
+    ctx.fillStyle = '#f7d547';
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// small star path
+function star(ctx, x, y, spikes, outerRadius, innerRadius) {
+  let rot = Math.PI / 2 * 3;
+  let cx = x;
+  let cy = y;
+  let step = Math.PI / spikes;
+  ctx.beginPath();
+  ctx.moveTo(cx, cy - outerRadius);
+  for(let i = 0; i < spikes; i++) {
+    let x = cx + Math.cos(rot) * outerRadius;
+    let y = cy + Math.sin(rot) * outerRadius;
+    ctx.lineTo(x, y);
+    rot += step;
+
+    x = cx + Math.cos(rot) * innerRadius;
+    y = cy + Math.sin(rot) * innerRadius;
+    ctx.lineTo(x, y);
+    rot += step;
+  }
+  ctx.lineTo(cx, cy - outerRadius);
+  ctx.closePath();
+}
+
+// draw center
+function drawCenter(){
+  ctx.beginPath();
+  ctx.fillStyle = '#012028';
+  ctx.arc(CENTER.x, CENTER.y, 42, 0, Math.PI*2);
+  ctx.fill();
+  ctx.strokeStyle = '#033740';
+  ctx.stroke();
+  ctx.fillStyle = '#bfe6ef';
+  ctx.font = '13px sans-serif';
+  ctx.fillText('HOME', CENTER.x - 18, CENTER.y + 5);
+}
+
+// click handling: detect token clicks (either in home area or on track)
+canvas.addEventListener('click', (ev)=>{
+  const rect = canvas.getBoundingClientRect();
+  const x = ev.clientX - rect.left;
+  const y = ev.clientY - rect.top;
+  // find any selectable token near click
+  for(let s of selectable){
+    const t = tokens[s.player][s.idx];
+    const pos = tokenPosition(t);
+    let cx, cy;
+    if(pos.type === 'home'){
+      const base = homeBases[s.player];
+      const i = s.idx;
+      cx = base.x - 30 + (i%2)*45;
+      cy = base.y - 30 + Math.floor(i/2)*45;
+    } else if(pos.type === 'track'){
+      const c = trackCoords[pos.index];
+      cx = c.x; cy = c.y;
+    } else if(pos.type === 'finish'){
+      const c = finishCoords[s.player][pos.index];
+      cx = c.x; cy = c.y;
+    } else {
+      cx = CENTER.x; cy = CENTER.y;
+    }
+    if(distance(x,y,cx,cy) <= TOKEN_R + 6){
+      // user clicked this selectable token: move
+      applyMove(s.player, s.idx);
+      return;
+    }
+  }
+  // if no selectable token clicked, maybe user clicked a home token to bring out? We require roll==6 to have selectable include home tokens
+});
+
+// distance helper
+function distance(x1,y1,x2,y2){
+  const dx = x1-x2; const dy = y1-y2;
+  return Math.sqrt(dx*dx + dy*dy);
+}
+
+// update players list UI
+function updatePlayersList(){
+  playersList.innerHTML = '';
+  for(let p=0;p<NUM_PLAYERS;p++){
+    const div = document.createElement('div');
+    div.className = 'player-row';
+    const colorDot = document.createElement('div');
+    colorDot.className = 'token-mini';
+    colorDot.style.background = PLAYER_COLORS[p];
+    div.appendChild(colorDot);
+    const txt = document.createElement('div');
+    const finishedCount = tokens[p].filter(tt=>tt.finished).length;
+    txt.innerHTML = `<strong>P${p+1}</strong> — finished ${finishedCount}/${TOKENS_PER_PLAYER}`;
+    if(p === currentPlayer) txt.innerHTML += ' ← turn';
+    div.appendChild(txt);
+    playersList.appendChild(div);
+  }
+}
+
+// status setter
+function setStatus(s){
+  if(typeof s === 'function'){
+    statusEl.textContent = s(statusEl.textContent);
+  } else {
+    statusEl.textContent = 'Status: ' + s;
+  }
+}
+
+// wire UI
+rollBtn.addEventListener('click', ()=>{
+  if(!gameActive) return;
+  // only allow roll if there is no pending diceValue (user must resolve previous before rolling)
+  if(diceValue !== -1){
+    setStatus('You must use or pass the current roll before rolling again.');
+    return;
+  }
+  rollDiceAnim();
+});
+newBtn.addEventListener('click', ()=>{ if(confirm('Start a new game?')) newGame(); });
+rulesBtn.addEventListener('click', ()=>{
+  alert(
+`Short Rules (classic):
+• Need a 6 to bring a token out of home.
+• On your turn roll the dice. Select a token to move.
+• If you land on an opponent on a non-safe square, you capture it (send to home).
+• Landing on a 6 gives an extra roll.
+• First player to get all 4 tokens to the center (finish column) wins.`
+);
+});
+
+// keyboard support (space to roll)
+window.addEventListener('keydown', (e)=>{
+  if(e.code === 'Space'){ e.preventDefault(); rollBtn.click(); }
+});
+
+// initial draw & status
+updatePlayersList();
+draw();
+
+</script>
+</body>
+</html>
